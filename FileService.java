@@ -1,151 +1,127 @@
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.List;
 
 public class FileService {
+    private final Path filePath;
 
-    private static final String FILE_NAME = "students.txt";
-
-    public void saveStudent(Student student) {
-
-        try (BufferedWriter buffer =
-                new BufferedWriter(new FileWriter(FILE_NAME, true))) {
-
-            buffer.write(student.toString());
-            buffer.newLine();
-
-         //   System.out.println("Student saved successfully.");
-
-        } catch (IOException e) {
-            System.out.println("Error writing data: " + e.getMessage());
-        }
+    public FileService() {
+        this("students.csv");
     }
 
-    public ArrayList<Student> loadStudents() {
+    public FileService(String fileName) {
+        this.filePath = Paths.get(fileName);
+    }
 
-        ArrayList<Student> students = new ArrayList<>();
-
-        try (BufferedReader reader =
-                new BufferedReader(new FileReader(FILE_NAME))) {
-
-            String line;
-
-            while ((line = reader.readLine()) != null) {
-
-                String[] data = line.split(",", -1);
-
-                int id = Integer.parseInt(data[0].trim());
-                String name = data[1].trim();
-                int age = Integer.parseInt(data[2].trim());
-                double marks = Double.parseDouble(data[3].trim());
-
-                students.add(new Student(id, name, age, marks));
-            }
-
-        } catch (FileNotFoundException e) {
-            System.out.println("No existing student records.");
-        } catch (IOException e) {
-            System.out.println("Error reading file: " + e.getMessage());
-        } catch (NumberFormatException e) {
-            System.out.println("Invalid student data: " + e.getMessage());
+    public List<Student> loadStudents() {
+        List<Student> students = new ArrayList<>();
+        if (!Files.exists(filePath)) {
+            return students;
         }
 
+        int lineNumber = 0;
+        try (BufferedReader reader = Files.newBufferedReader(filePath, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lineNumber++;
+                if (line.trim().isEmpty()) continue;
+                try {
+                    List<String> fields = parseCsvLine(line);
+                    if (fields.size() != 4) throw new IllegalArgumentException("Expected 4 CSV fields");
+                    int id = Integer.parseInt(fields.get(0).trim());
+                    String name = fields.get(1);
+                    int age = Integer.parseInt(fields.get(2).trim());
+                    double marks = Double.parseDouble(fields.get(3).trim());
+                    students.add(new Student(id, name, age, marks));
+                } catch (RuntimeException ex) {
+                    System.err.println("Skipping invalid record at " + filePath + ":" + lineNumber
+                            + " (" + ex.getMessage() + ")");
+                }
+            }
+        } catch (IOException ex) {
+            System.err.println("Could not read " + filePath + ": " + ex.getMessage());
+        }
         return students;
     }
 
-    public void deleteStudentById(int id) {
-
-    ArrayList<String> updatedLines = new ArrayList<>();
-
-    try (BufferedReader reader =
-             new BufferedReader(new FileReader(FILE_NAME))) {
-
-        String line;
-
-        while ((line = reader.readLine()) != null) {
-
-            String[] data = line.split(",", -1);
-
-            int studentId = Integer.parseInt(data[0].trim());
-
-            // Keep all records except matching ID
-            if (studentId != id) {
-                updatedLines.add(line);
+    // Rewrites the entire file through a temporary file, then replaces the old file.
+    public boolean saveStudents(List<Student> students) {
+        Path absolute = filePath.toAbsolutePath();
+        Path parent = absolute.getParent();
+        Path temp = null;
+        try {
+            if (parent != null) Files.createDirectories(parent);
+            temp = Files.createTempFile(parent, "students-", ".tmp");
+            try (BufferedWriter writer = Files.newBufferedWriter(temp, StandardCharsets.UTF_8)) {
+                for (Student student : students) {
+                    writer.write(toCsv(student));
+                    writer.newLine();
+                }
             }
-        }
 
-    } catch (IOException e) {
-        System.out.println("Error reading file: " + e.getMessage());
-        return;
+            try {
+                Files.move(temp, absolute, StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ex) {
+                Files.move(temp, absolute, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return true;
+        } catch (IOException ex) {
+            System.err.println("Could not save student records: " + ex.getMessage());
+            if (temp != null) {
+                try { Files.deleteIfExists(temp); } catch (IOException ignored) { }
+            }
+            return false;
+        }
     }
 
-    try (BufferedWriter writer =
-             new BufferedWriter(new FileWriter(FILE_NAME, false))) {
-
-        for (String line : updatedLines) {
-            writer.write(line);
-            writer.newLine();
-        }
-
-
-    } catch (IOException e) {
-        System.out.println("Error updating file: " + e.getMessage());
+    private String toCsv(Student student) {
+        return student.getId() + "," + quote(student.getName()) + ","
+                + student.getAge() + "," + student.getMarks();
     }
-}
-    public void updateStudentById(int id, String name, int age, double marks) {
 
-    ArrayList<String> updatedLines = new ArrayList<>();
+    private String quote(String value) {
+        return "\"" + value.replace("\"", "\"\"") + "\"";
+    }
 
-    boolean found = false;
+    // Supports quoted CSV fields, commas and escaped double quotes.
+    private List<String> parseCsvLine(String line) {
+        List<String> fields = new ArrayList<>();
+        StringBuilder field = new StringBuilder();
+        boolean quoted = false;
 
-    try (BufferedReader reader =
-             new BufferedReader(new FileReader(FILE_NAME))) {
-
-        String line;
-
-        while ((line = reader.readLine()) != null) {
-
-            String[] data = line.split(",", -1);
-
-            int studentId = Integer.parseInt(data[0].trim());
-
-            if (studentId == id) {
-
-                // Replace existing student record
-                updatedLines.add(
-                    id + "," + name + "," + age + "," + marks
-                );
-
-                found = true;
-
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (quoted) {
+                if (c == '"') {
+                    if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                        field.append('"');
+                        i++;
+                    } else {
+                        quoted = false;
+                    }
+                } else {
+                    field.append(c);
+                }
+            } else if (c == ',' ) {
+                fields.add(field.toString());
+                field.setLength(0);
+            } else if (c == '"' && field.length() == 0) {
+                quoted = true;
             } else {
-
-                // Keep other student records unchanged
-                updatedLines.add(line);
+                field.append(c);
             }
         }
-
-    } catch (IOException | NumberFormatException e) {
-        System.out.println("Error reading file: " + e.getMessage());
-        return;
+        if (quoted) throw new IllegalArgumentException("Unclosed quoted CSV field");
+        fields.add(field.toString());
+        return fields;
     }
-
-    if (!found) {
-        System.out.println("Student ID not found in file!");
-        return;
-    }
-
-    try (BufferedWriter writer =
-             new BufferedWriter(new FileWriter(FILE_NAME, false))) {
-
-        for (String record : updatedLines) {
-            writer.write(record);
-            writer.newLine();
-        }
-
-    //    System.out.println("Student file updated successfully.");
-
-    } catch (IOException e) {
-        System.out.println("Error updating file: " + e.getMessage());
-    }
-}
 }
